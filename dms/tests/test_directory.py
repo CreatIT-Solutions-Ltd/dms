@@ -240,6 +240,68 @@ class DirectoryTestCaseBase(StorageDatabaseBaseCase):
     def test_size(self):
         self.assertTrue(self.directory.size, msg="The directory should have a size")
 
+    def _get_expected_totals(self, directories):
+        """Totals computed with one child_of search per directory."""
+        files = directories.env["dms.file"]
+        result = {}
+        for directory in directories:
+            count = directories.search_count([("id", "child_of", directory.id)])
+            sizes = files.sudo().search_read(
+                [("directory_id", "child_of", directory.id)], ["size"]
+            )
+            result[directory.id] = (
+                count - 1 if count > 0 else 0,
+                files.search_count([("directory_id", "child_of", directory.id)]),
+                sum(r["size"] for r in sizes),
+            )
+        return result
+
+    def test_totals_batch(self):
+        """Totals of several directories are computed together and give the same
+        result as one search per directory, also for a user who cannot access
+        part of the tree."""
+        manager_group = self.access_group_model.create(
+            {
+                "name": "Managers only",
+                "explicit_user_ids": [(6, 0, [self.dms_manager_user.id])],
+            }
+        )
+        roots = self.directory_model
+        for _i in range(3):
+            root = self.create_directory(storage=self.storage)
+            child = self.create_directory(directory=root)
+            self.create_file(directory=self.create_directory(directory=child))
+            hidden = self.create_directory(directory=child)
+            hidden.write(
+                {
+                    "inherit_group_ids": False,
+                    "group_ids": [(6, 0, manager_group.ids)],
+                }
+            )
+            self.create_file(directory=hidden)
+            roots |= root
+        for user in (self.dms_manager_user, self.dms_user):
+            directories = self.directory_model.with_user(user).search(
+                [("id", "child_of", roots.ids)]
+            )
+            expected = self._get_expected_totals(directories)
+            directories.invalidate_recordset()
+            with self.assertQueryCount(10):
+                totals = {
+                    d.id: (d.count_total_directories, d.count_total_files, d.size)
+                    for d in directories
+                }
+            self.assertEqual(totals, expected)
+        visible = self.directory_model.with_user(self.dms_user).search(
+            [("id", "child_of", roots.ids)]
+        )
+        all_directories = self.directory_model.search([("id", "child_of", roots.ids)])
+        self.assertLess(
+            len(visible),
+            len(all_directories),
+            msg="The dms-user should not see the managers-only directories",
+        )
+
     @users("dms-manager", "dms-user")
     def test_check_name_root_sub(self):
         """A sub-directory and a root directory can have the same name."""

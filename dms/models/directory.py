@@ -425,22 +425,48 @@ class DmsDirectory(models.Model):
         for record in self:
             record.count_elements = record.count_files + record.count_directories
 
+    def _get_subtree_totals(self, model, field, aggregate):
+        """Aggregate ``model`` records over the subtree of each directory in self
+        (the directory itself included).
+
+        A single search is done for the whole recordset, applying the same record
+        rules as a ``child_of`` search per directory would, and the totals are
+        dispatched to the ancestors using ``parent_path``.
+        """
+        ids = {rid for rid in self._ids if isinstance(rid, int)}
+        totals = defaultdict(float)
+        if not ids:
+            return totals
+        domain = [(field, "child_of", list(ids))]
+        if model._name == self._name:
+            rows = [
+                (rec.parent_path, 1)
+                for rec in model.search_fetch(domain, ["parent_path"])
+            ]
+        else:
+            groups = model._read_group(domain, [field], [aggregate])
+            directories = self.sudo().browse([d.id for d, _value in groups])
+            path_by_id = {d.id: d.parent_path for d in directories}
+            rows = [(path_by_id[d.id], value) for d, value in groups]
+        for parent_path, value in rows:
+            for part in (parent_path or "").split("/"):
+                if part and int(part) in ids:
+                    totals[int(part)] += value or 0
+        return totals
+
     def _compute_count_total_directories(self):
+        totals = self._get_subtree_totals(self, "id", "__count")
         for record in self:
-            count = (
-                self.search_count([("id", "child_of", record.id)]) if record.id else 0
-            )
+            count = int(totals[record.id]) if record.id else 0
             record.count_total_directories = count - 1 if count > 0 else 0
 
     def _compute_count_total_files(self):
-        model = self.env["dms.file"]
+        totals = self._get_subtree_totals(
+            self.env["dms.file"], "directory_id", "__count"
+        )
         for record in self:
             # Prevent error in some NewId cases
-            record.count_total_files = (
-                model.search_count([("directory_id", "child_of", record.id)])
-                if record.id
-                else 0
-            )
+            record.count_total_files = int(totals[record.id]) if record.id else 0
 
     def _compute_count_total_elements(self):
         for record in self:
@@ -449,17 +475,12 @@ class DmsDirectory(models.Model):
             )
 
     def _compute_size(self):
-        sudo_model = self.env["dms.file"].sudo()
+        totals = self._get_subtree_totals(
+            self.env["dms.file"].sudo(), "directory_id", "size:sum"
+        )
         for record in self:
             # Avoid NewId
-            if not record.id:
-                record.size = 0
-                continue
-            recs = sudo_model.search_read(
-                domain=[("directory_id", "child_of", record.id)],
-                fields=["size"],
-            )
-            record.size = sum(rec.get("size", 0) for rec in recs)
+            record.size = totals[record.id] if record.id else 0
 
     @api.depends("size")
     def _compute_human_size(self):
